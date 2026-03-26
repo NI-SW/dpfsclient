@@ -1,0 +1,352 @@
+syntax = "proto3";
+
+package dpfsgrpc;
+
+/*
+  * SysCtl service definition
+  * This service provides system control operations, such as login, logoff, execSQL, getTableHandle, getIdxIter, etc.
+  * The service is implemented by the server and called by the client through gRPC.
+*/
+service SysCtl {
+  // 登录，返回登录结果和用户句柄
+  rpc Login(LoginReq) returns (LoginReply) {}
+
+  // 注销登录用户
+  rpc Logoff(LogoffReq) returns (OperateReply) {}
+
+  // 输入SQL语句，返回执行结果
+  rpc ExecSQL (Exesql) returns (OperateReply) {}
+  // 返回整表信息 ：： CCollection::m_cltInfoCache中的zptr指针指向的内容, 客户端直接使用CCollection::collectionStruct加载表信息
+  rpc GetTableHandle  (GetTableRequest) returns (GetTableReply) {}
+  // 传入要插入的数据，返回执行结果
+  rpc InsertTable     (InsertRequest) returns (OperateReply) {}
+  // 传入主键，返回一行数据
+  rpc GetRow          (GetRowRequest) returns (GetRowReply) {}
+  // 传入索引列名和值，返回检索迭代器
+  rpc GetIdxIter      (GetIdxIterReq) returns (GetIdxIterReply) {}
+  // 传入迭代器标识，释放服务器端的迭代器资源
+  rpc ReleaseIdxIter   (ReleaseIdxIterReq) returns (OperateReply) {}
+  // 传入迭代器标识，获取下一批结果集
+  rpc FetchNextRowSets   (FetchNextRowSetsReq) returns (FetchNextRowSetsReply) {}
+
+  // 创建可溯源结构
+  rpc CreateTracablePro (CreateTracableProReq) returns (CreateTracableProReply) {}
+  // 查询溯源信息，返回溯源结果
+  rpc TraceBack(TraceBackReq) returns (TraceBackReply) {}
+
+  // 执行交易操作，输入交易相关信息，返回执行结果
+  rpc MakeTrade (MakeTradeReq) returns (OperateReply) {}
+
+  // 继续向后获取结果集
+  // rpc nextRowSets () returns () {}
+  // 继续向前获取结果集
+  // rpc prevRowSets () returns () {}
+
+  // 传入要删除的行，返回执行结果
+  // rpc deleteItem      (htable) returns (operateReply) {}
+  // 输入表名，删除表
+  // rpc dropTable       (htable) returns (operateReply) {}
+
+  // 加入分布式组
+  // rpc JoinGroup (JoinGroupRequest) returns (JoinGroupReply) {}
+
+  // 请求不属于本节点，转发请求
+  // rpc RequestForward (RequestForwardRequest) returns (RequestForwardReply) {}
+
+}
+
+// 溯源信息包括：
+/*
+1. 追溯码：trace_code，int32类型，表示需要追溯的信息类型，例如：行级锁等待、死锁等。
+2. 追溯键值：key_val，bytes类型，表示需要追溯的信息的具体标识，例如：行级锁等待的行主键值等。
+3. 追溯结果：trace_back_result，bytes类型，表示追溯信息的结果，例如：等待的锁信息、死锁涉及的事务信息等。
+
+溯源码包含：表idx, 行主键值.
+示例
+
+// table that operate by system
+
+// 原料控制表
+create table apple.ingredient (
+bidx binary(16) NOT NULL PRIMARY KEY,
+name char(32) NOT NULL,
+);
+// contain base info of a production
+
+商品信息控制表
+create table apple.prodinfo(key char(32), value char(128));
+insert into apple.prodinfo values
+('商品名称', '苹果'), 
+('品牌', '洛川苹果'), 
+('保质期', '30'),
+('质检报告', 'https://mytest.com/jsbg.png'),
+('SPKZB', BIDX), // BIDX使用二进制形式保存, 商品控制表
+('JYKZB', BIDX), // 交易控制表
+('PLKZB', BIDX) // 配料控制表,
+
+商品控制表
+CREATE TABLE SPKZB (
+    uniID int not null primary key,          // 标识唯一商品。
+    time int NOT NULL,                       // 上一次查验时间(unix时间戳)，单位秒
+    taddr binary(24) NOT NULL,               // 记录最后一笔交易的表bidx和主键值，对应主键值必须为BIGINT类型
+    valid binary(1) NOT NULL,                // 标记商品对象是否失效
+    checkCount int NOT NULL,                 // 查验次数，至多127次
+);
+
+交易控制表表结构：
+交易id: 0
+交易商品起始uid: 0
+交易商品数量: 4
+买方名称: A
+买方地址: XX市XX区XX街道1号楼1单元
+买方联系方式: +86-13881811831
+卖方: B
+卖方地址: XX市XX区XX街道4号楼6单元
+卖方联系方式: +86-18810112423
+上一笔交易的主键值
+物流信息: ...
+其他信息: ...
+
+CREATE TABLE JYKZB (
+    tid bigint not null primary key,      // 交易id
+    buniID int NOT NULL,                  // 交易商品起始uid
+    num int NOT NULL,                     // 交易商品数量
+    buyer_name char(255) NOT NULL,        // 买方名称
+    buyer_addr char(255) NOT NULL,        // 买方地址  
+    buyer_contact char(32) NOT NULL,      // 买方联系方式
+    seller_name char(255) NOT NULL,       // 卖方名称
+    seller_addr char(255) NOT NULL,       // 卖方地址
+    seller_contact char(32) NOT NULL,     // 卖方联系方式
+    prev_tid bigint NOT NULL,             // 上一笔交易的主键值
+    logistics_info char(255) NOT NULL,    // 物流信息
+    other_info char(255) NOT NULL         // 其他信息
+);
+
+// 追溯信息查询示例：
+{
+  product_info
+  trade_block_list
+  
+}
+
+*/
+
+/*
+
+example:
+
+// contain base info of a production
+// 商品信息表
+create table manager.apple_SPXXB(key char(32), value char(128));
+insert into manager.apple_SPXXB values
+('商品名称', '苹果'), 
+('品牌', '洛川苹果'), 
+('保质期', '30'),
+('质检报告', 'https://mytest.com/jsbg.png'),
+('SPYLB', {gid, bid}),
+('SPKZB', {gid, bid}),
+('SPJYB', {gid, bid})
+(其它自定义信息)
+
+create table manager.apple_PLKZB (
+// 物料_prodinfo bidx, 物料表硬盘地址
+bidx binary(16) NOT NULL PRIMARY KEY
+);
+
+create table manager.apple_SPKZB(
+uid int not null primary key,   // 唯一标识一件商品
+ctime bigint not null,          // 上一次查验时间
+cstate bool not null,           // 查验商品的状态，有效或失效
+ccount int not null             // 查验次数
+)                         
+
+
+// table that log the transaction
+// 商品交易表
+create table manager.apple_SPJYB (
+JYID BIGINT not null primary key,    // 交易id
+SPJYQSID INT NOT NULL,               // 交易起始产品id
+SPJYSL INT NOT NULL,                 // 交易数量
+MFMC  CHAR(64) NOT NULL,             // 买方名称
+MFDZ  CHAR(64) NOT NULL              // 买方地址
+MFLX  CHAR(32) NOT NULL,             // 买方联系方式
+FFMC  CHAR(64) NOT NULL,             // 卖方名称
+FFDZ  CHAR(64) NOT NULL              // 卖方地址
+FFLX  CHAR(32) NOT NULL,             // 卖方联系方式
+PREV_JYID BIGINT NOT NULL,           // 上一笔交易的id
+LOGISTICS_INFO CHAR(255) NOT NULL,   // 物流信息
+OTHER_INFO CHAR(255) NOT NULL        // 其他信息
+)
+*/
+
+// 初版部分参数固定，后续根据实际需求调整
+message MakeTradeReq {
+  int32 husr = 1;
+  string schema_name = 2;
+  string structure_name = 3;
+  int64 jyid = 4;
+  int32 start_uid = 5; // 交易商品起始uid
+  int32 num = 6; // 交易商品数量
+  // 买方名称
+  string mfmc = 7;
+  // 买方地址
+  string mfdz = 8;
+  // 买方联系方式
+  string mflx = 9;
+  // 卖方名称
+  string ffmc = 10;
+  // 卖方地址
+  string ffdz = 11;
+  // 卖方联系方式
+  string fflx = 12;
+  // 物流信息
+  string wlxx = 13;
+  // 其他信息,暂不处理
+  string others = 14;
+  // 发生金额
+  string fsje = 15;
+
+}
+
+message CreateTracableProReq {
+  int32 husr = 1;
+  string schema_name = 2;
+  string structure_name = 3;
+  map<string, string> base_info = 4; // 需要包含特定列名和对应的值，例如：SPKZB表中的bidx列和具体的bidx值
+  // <配料名称，配料占比>
+  map<string, string> ingredient_infos = 5;
+  // repeated string ingredient_names = 5; // 需要追溯的原料控制表名
+  int32 total_production_num = 6; // 总商品量
+}
+
+message CreateTracableProReply {
+  int32 rc = 1;
+  string msg = 2;
+  bytes trace_code_prefix = 3; // 生成的追溯码前缀，用于标识批次
+  // 使用前缀组合产品id可以溯源一件产品
+}
+
+message TraceBackReq {
+  int32 husr = 1;
+  // |SPXXB BIDX(16B)|PRODUCTION ID(4B)|
+  bytes trace_code = 2;
+  bool show_detail = 3; // 是否展示详细信息
+}
+
+message TraceBackReply {
+  int32 rc = 1;
+  string msg = 2;
+  string trace_back_result = 3;
+}
+
+message LoginReq {
+  string username = 1;
+  string password = 2;
+}
+
+message LoginReply {
+  int32 rc = 1;
+  int32 husr = 2;
+  string msg = 3;
+}
+message LogoffReq {
+  int32 husr = 1;
+}
+
+
+message Exesql {
+  int32 husr = 1;
+  string sql = 2;
+}
+
+message OperateReply {
+  int32 rc = 1;
+  string msg = 2;
+}
+
+// The request message containing the user's name.
+message GetTableRequest {
+  int32 husr = 1;
+  string schema_name = 2;
+  string table_name = 3;
+}
+
+
+// The response message containing the greetings
+message GetTableReply {
+  bytes table_handle = 1;
+  int32 rc = 2;
+  string msg = 3;
+  // m_cltInfoCache中的zptr指针指向的内容
+  bytes table_infos = 4;
+}
+
+message GetRowRequest {
+  // table bidx
+  int32 husr = 1;
+  string schema_name = 2;
+  string tab_name = 3;
+  bytes key_val = 4;
+}
+
+message GetRowReply {
+  // return code
+  int32 rc = 1;
+
+  // return message
+  string msg = 2;
+
+  // row data, copy to CItem's m_ptr 
+  bytes row_data = 3;
+}
+
+message InsertRequest {
+  int32 husr = 1;
+  bytes table_handle = 2;
+  // fullfile CItem's rowNumber
+  uint32 row_number = 3;
+  // copy to CItem's m_ptr 
+  bytes row_data = 4;
+}
+
+message GetIdxIterReq {
+  int32 husr = 1;
+  bytes table_handle = 2;
+  repeated string col_names = 3;
+  repeated bytes key_vals = 4;
+}
+
+message GetIdxIterReply {
+  int32 rc = 1;
+  string msg = 2;
+  // idxIterIdentifier, used to identify the iterator on the server side, and used for subsequent data I/O operations on this table, such as query, etc.
+  int32 hidx = 3;
+  // 当前批次结果
+  bytes data = 4;
+}
+
+message FetchNextRowSetsReq {
+  int32 rc = 1;
+  int32 husr = 2;
+  int32 hidx = 3;
+  int32 acquire_row_number = 4;
+
+}
+
+message FetchNextRowSetsReply {
+  int32 rc = 1;
+  string msg = 2;
+  repeated bytes data = 3;
+}
+
+message ReleaseIdxIterReq {
+  int32 rc = 1;
+  int32 husr = 2;
+  int32 hidx = 3;
+}
+
+
+/*
+protoc -I . --grpc_out=. --plugin=protoc-gen-grpc=`which grpc_cpp_plugin` sysrpc.proto
+protoc -I . --cpp_out=. sysrpc.proto
+*/

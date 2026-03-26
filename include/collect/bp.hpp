@@ -1,0 +1,1426 @@
+// b+ tree for product index
+#pragma once
+#include <algorithm>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include <threadlock.hpp>
+#include <basic/dpfsconst.hpp>
+#include <collect/page.hpp>
+#include <collect/diskman.hpp>
+#include <collect/collect.hpp>
+#include <dpendian.hpp>
+#include <unordered_map>
+
+// #define __BPDEBUG__
+
+#ifdef __BPDEBUG__
+#include <iostream>
+#include <string>
+using namespace std;
+constexpr int indOrder = 5;
+
+// static int myabort() {
+//     return -ERANGE;
+//     abort();
+//     return 0;
+// }
+// #define ERANGE myabort()
+extern const char hex_chars[];
+#endif
+
+// if key length exceed maxKeyLen, when search compare only first maxKeyLen bytes
+constexpr uint16_t maxSearchKeyLen = 1024; // 1024B
+constexpr uint32_t maxInrowLen = 32768; // 32KB
+// constexpr size_t MAXROWLEN =  16 * 1024 * 1024; // 16MB 
+// constexpr uint8_t PAGESIZE = 4;
+// constexpr uint32_t ROWPAGESIZE = 32; 
+// constexpr int ROWLEN = 512; // default row length
+// parent + prev + next + keyCnt + isLeaf + reserve
+// constexpr uint8_t hdrSize = 8 + 8 + 8 + 2 + 1 + 5; 
+
+constexpr uint16_t MAXKEYLEN = maxSearchKeyLen;
+// constexpr dpfs_datatype_t KEYTYPE = dpfs_datatype_t::TYPE_BIGINT;
+const std::vector<std::pair<uint8_t, dpfs_datatype_t>> emptyCmpTypes = { {8, dpfs_datatype_t::TYPE_BIGINT} };
+
+
+struct KEY_T {
+    // dpfs_datatype_t type = dpfs_datatype_t::TYPE_NULL;
+
+    KEY_T(const std::vector<std::pair<uint8_t, dpfs_datatype_t>>& cmpTyps = emptyCmpTypes) : data(0), len(0), compareTypes(cmpTyps) {}
+    KEY_T(const KEY_T& other) : data(other.data), len(other.len), compareTypes(other.compareTypes) {}
+    KEY_T(void* val, size_t length, const std::vector<std::pair<uint8_t, dpfs_datatype_t>>& cmpTyps = emptyCmpTypes) : data(reinterpret_cast<uint8_t*>(val)), len(length), compareTypes(cmpTyps) {}
+    ~KEY_T() = default;
+
+    uint8_t* data = nullptr;
+    size_t len = 0;
+    // dpfs_datatype_t KEYTYPE = dpfs_datatype_t::TYPE_BIGINT;
+    bool hostMemory = false;
+
+    // | size | type |
+    const std::vector<std::pair<uint8_t, dpfs_datatype_t>>& compareTypes;
+
+
+    // KEY_T& operator=(const KEY_T& other) noexcept = delete;
+    KEY_T& operator=(const KEY_T& other) {
+        if (this != &other) {
+            if (!data) {
+				throw std::runtime_error("data is null");
+            }
+            memcpy(data, other.data, other.len);
+        }
+        return *this;
+    }
+
+
+    bool operator==(const KEY_T& other) const noexcept {
+        //switch (KEYTYPE) {
+        //case dpfs_datatype_t::TYPE_INT:
+        //    return *(int32_t*)data == *(int32_t*)other.data;
+        //    break;
+        //case dpfs_datatype_t::TYPE_FLOAT:
+        //    return *(float*)data == *(float*)other.data;
+        //    break;
+        //case dpfs_datatype_t::TYPE_BIGINT:
+        //    return *(int64_t*)data == *(int64_t*)other.data;
+        //    break;
+        //case dpfs_datatype_t::TYPE_DOUBLE:
+        //    return *(double*)data == *(double*)other.data;
+        //    break;
+        //case dpfs_datatype_t::TYPE_CHAR:
+        //case dpfs_datatype_t::TYPE_VARCHAR:
+        //    return std::strncmp((const char*)data, (const char*)other.data, len) == 0;
+        //    break;
+        //case dpfs_datatype_t::TYPE_BLOB:
+        //case dpfs_datatype_t::TYPE_BINARY:
+        //    return std::memcmp(data, other.data, len) == 0;
+        //    break;
+        //default:
+        //    break;
+        //}
+        return std::memcmp(data, other.data, len) == 0;
+    }
+    bool operator<(const KEY_T& other) const noexcept {
+        size_t offset = 0;
+        void* cmpPtr = nullptr;
+        void* targetPtr = nullptr;
+        for(const auto& cmpt : compareTypes) {
+            cmpPtr = data + offset;
+            targetPtr = other.data + offset;
+            dpfs_datatype_t compareType = cmpt.second;
+            auto cmpResult = 0;
+            switch (compareType) {
+                case dpfs_datatype_t::TYPE_INT:
+                    if ((*(int32_t*)cmpPtr < *(int32_t*)targetPtr)) return true;
+                    else if (*(int32_t*)cmpPtr == *(int32_t*)targetPtr) break;
+                    else return false;
+                    break;
+                case dpfs_datatype_t::TYPE_FLOAT:
+                    if ((*(float*)cmpPtr < *(float*)targetPtr)) return true;
+                    else if (*(float*)cmpPtr == *(float*)targetPtr) break;
+                    else return false;
+                    break;
+                case dpfs_datatype_t::TYPE_BIGINT:
+                    if ((*(int64_t*)cmpPtr < *(int64_t*)targetPtr)) return true;
+                    else if (*(int64_t*)cmpPtr == *(int64_t*)targetPtr) break;
+                    else return false;
+                    break;
+                case dpfs_datatype_t::TYPE_DOUBLE:
+                    if ((*(double*)cmpPtr < *(double*)targetPtr)) return true;
+                    else if (*(double*)cmpPtr == *(double*)targetPtr) break;
+                    else return false;
+                    break;
+                case dpfs_datatype_t::TYPE_CHAR:
+                case dpfs_datatype_t::TYPE_VARCHAR:
+                    cmpResult = std::strncmp((const char*)cmpPtr, (const char*)targetPtr, cmpt.first);
+                    if (cmpResult < 0) return true;
+                    else if (cmpResult == 0) break;
+                    else return false;
+                    break;
+                case dpfs_datatype_t::TYPE_BLOB:
+                case dpfs_datatype_t::TYPE_BINARY:
+                    cmpResult = std::memcmp(cmpPtr, targetPtr, cmpt.first);
+                    if (cmpResult < 0) return true;
+                    else if (cmpResult == 0) break;
+                    else return false;
+                    break;
+                default:
+                    break;
+            }
+            offset += cmpt.first;
+        }
+        return false;
+        // return std::memcmp(data, other.data, len) < 0;
+    }
+};
+
+
+template <typename VALUE_T = KEY_T, typename SIZETYPE = size_t>
+class CKeyVec : public CVarLenVec<VALUE_T, SIZETYPE> {
+public:
+    CKeyVec(uint8_t* begin, SIZETYPE& sz, size_t valueLength, size_t maxSize, const std::vector<std::pair<uint8_t, dpfs_datatype_t>>& compareTypes) : CVarLenVec<VALUE_T, SIZETYPE>(begin, sz, valueLength, maxSize), cmpFun(compareTypes){
+        // extra one reserve for split action
+    }
+    virtual ~CKeyVec() = default;
+
+    /*
+        @param pos position to insert
+        @param val value to insert
+        @return 0 on success, -ERANGE on exceed max size
+        @note insert val to the vector at pos, mark as virtual if need override insert method
+    */
+    virtual int insert(const VALUE_T& val) noexcept {
+        // find the pos of the key to insert
+
+        auto pos = std::lower_bound(this->begin(), this->end(), val, cmpFun);
+        #ifdef __BPDEBUG__
+        cout << "pos : " << pos - this->begin() << endl;
+        #endif
+        if (pos != this->end() && *pos == val) {
+            // Key already exists
+            return -EEXIST;
+        }
+        if (this->vecSize >= this->maxSize) {
+            return -ERANGE;
+        }
+		this->CVarLenVec<VALUE_T, SIZETYPE>::insert(pos - this->begin(), val);
+        // std::memmove(pos + 1, pos, (this->values + this->vecSize - pos) * this->valueLen);
+        // *pos = val;
+        // ++this->vecSize;
+
+        return pos - this->begin();
+    }
+
+    virtual int erase(const VALUE_T& val) noexcept override {
+        auto pos = std::lower_bound(this->begin(), this->end(), val, cmpFun);
+        if (pos == this->end() || !(*pos == val)) {
+            // key not found
+            return -ENOENT;
+        }
+        size_t erasePos = pos - this->begin();
+        std::memmove(&this->values[erasePos * this->valueLen], &this->values[(erasePos + 1) * this->valueLen], (this->vecSize - erasePos - 1) * this->valueLen);
+        --this->vecSize;
+        return pos - this->begin();
+    }
+
+    int erase(const int& begin, const int& end) {
+        return CVarLenVec<VALUE_T, SIZETYPE>::erase(begin, end);
+    }
+
+    int erase(const typename CVarLenVec<VALUE_T, SIZETYPE>::iterator& it) {
+        return typename CVarLenVec<VALUE_T, SIZETYPE>::erase(it);
+    }
+
+    /*
+        @param key: key to search
+        @return position of the key on success, -ENOENT if not found
+        @note search key in the vector
+    */
+    int search(const VALUE_T& val) const noexcept {
+        auto pos = std::lower_bound(this->begin(), this->end(), val, cmpFun);
+        return pos - this->begin();
+    }
+
+    int concate_front(const CKeyVec<VALUE_T, SIZETYPE>& fromVec) noexcept {
+        return CVarLenVec<VALUE_T, SIZETYPE>::concate_front(static_cast<const CVarLenVec<VALUE_T, SIZETYPE>&>(fromVec));
+    }
+
+    int concate_back(const CKeyVec<VALUE_T, SIZETYPE>& fromVec) noexcept {
+        return CVarLenVec<VALUE_T, SIZETYPE>::concate_back(static_cast<const CVarLenVec<VALUE_T, SIZETYPE>&>(fromVec));
+    }
+
+private:
+    struct compareByTwoKey {
+        compareByTwoKey(const std::vector<std::pair<uint8_t, dpfs_datatype_t>>& cmpTyps) : compareTypes(cmpTyps) {
+
+        }
+
+        bool operator()(const VALUE_T& val1, const VALUE_T& val2) {
+            size_t offset = 0;
+            uint8_t* cmpPtr = nullptr;
+            uint8_t* targetPtr = nullptr;
+            for(const auto& cmpt : compareTypes) {
+                cmpPtr = val1.data + offset;
+                targetPtr = val2.data + offset;
+                dpfs_datatype_t compareType = cmpt.second;
+                auto cmpResult = 0;
+                switch (compareType) {
+                case dpfs_datatype_t::TYPE_INT:
+                    if (*(int32_t*)cmpPtr < *(int32_t*)targetPtr) return true;   // if first is less, return true
+                    else if (*(int32_t*)cmpPtr == *(int32_t*)targetPtr) break;   // judge next value
+                    else return false;                                           // first is greater, return false
+                    break;
+                case dpfs_datatype_t::TYPE_FLOAT:
+                    if (*(float*)cmpPtr < *(float*)targetPtr) return true;
+                    else if (*(float*)cmpPtr == *(float*)targetPtr) break;
+                    else return false;
+                    break;
+                case dpfs_datatype_t::TYPE_BIGINT:
+                    if (*(int64_t*)cmpPtr < *(int64_t*)targetPtr) return true;
+                    else if (*(int64_t*)cmpPtr == *(int64_t*)targetPtr) break;
+                    else return false;
+                    break;
+                case dpfs_datatype_t::TYPE_DOUBLE:
+                    if (*(double*)cmpPtr < *(double*)targetPtr) return true;
+                    else if (*(double*)cmpPtr == *(double*)targetPtr) break;
+                    else return false;
+                    break;
+                case dpfs_datatype_t::TYPE_CHAR:
+                case dpfs_datatype_t::TYPE_VARCHAR:
+                    cmpResult = std::strncmp((const char*)cmpPtr, (const char*)targetPtr, cmpt.first);
+                    if (cmpResult < 0) return true;
+                    else if (cmpResult == 0) break;
+                    else return false;
+                    break;
+                case dpfs_datatype_t::TYPE_BLOB:
+                case dpfs_datatype_t::TYPE_BINARY:
+                    cmpResult = std::memcmp(cmpPtr, targetPtr, cmpt.first);
+                    if (cmpResult < 0) return true;
+                    else if (cmpResult == 0) break;
+                    else return false;
+                    break;
+                default:
+                    break;
+                }
+                offset += cmpt.first;
+            }
+            // equal
+            return false;
+            // return std::memcmp(val1.data, val2.data, val1.len) < 0;
+        }
+        const std::vector<std::pair<uint8_t, dpfs_datatype_t>>& compareTypes;
+        // dpfs_datatype_t compareType = dpfs_datatype_t::TYPE_BIGINT;
+    };
+    compareByTwoKey cmpFun;
+
+};
+
+
+class CBPlusTree {
+private:
+using child_t = uint64_t;
+class CChildVec;
+class CRowVec;
+    
+    // for one node data in b+ tree
+    struct NodeData {
+        explicit NodeData(CPage& page, uint8_t keyLength, uint8_t pageSize, uint8_t rowPageSize, uint32_t rowLen) : 
+        m_page(page), 
+        keyLen(keyLength), 
+        m_pageSize(pageSize), 
+        m_rowPageSize(rowPageSize), 
+        m_rowLen(rowLen) {
+            #ifdef __BPDEBUG__
+            std::cout << "NodeData constructor called, pagesize = " << pageSize << "rowPageSize = " << rowPageSize << "rowLen = " << rowLen << std::endl;
+            #endif
+        };
+        NodeData(const NodeData& nd) = delete;
+        NodeData(NodeData&& nd) noexcept;
+        NodeData& operator=(NodeData&& nd);
+        // use pointer as reference
+        NodeData& operator=(NodeData* nd);
+
+        ~NodeData();
+        // int initNode(bool isLeaf, int32_t order);
+        // use data from zptr
+        int initNode(bool isLeaf, int32_t order, const std::vector<std::pair<uint8_t, dpfs_datatype_t>>& keyType);
+        int initNodeByLoad(bool isLeaf, int32_t order, void* zptr, const std::vector<std::pair<uint8_t, dpfs_datatype_t>>& keyType);
+        int deInitNode();
+        /*
+            @param key: key to insert
+            @param lchild: left child bid, 0 if do not update
+            @param rchild: right child bid, it must be valid
+            @return 0 on success, else on failure
+        */
+        int insertChild(const KEY_T& key, uint64_t lchild, uint64_t rchild);
+
+        /*
+            @param key: key to insert
+            @param rowData: pointer to row data
+            @param dataLen: length of row data
+            @return 0 on success, else on failure
+        */
+        int pushBackChild(const KEY_T& key, uint64_t childBid);
+
+        /*
+            @param fromNode: node to copy from
+            @param concateKey: key to insert between two child vectors
+            @return 0 on success, else on failure
+        */
+        int pushBackChilds(const NodeData& fromNode, const KEY_T& concateKey) noexcept;
+
+        /*
+            @param key: key to insert
+            @param rowData: pointer to row data
+            @param dataLen: length of row data
+            @return 0 on success, else on failure
+        */
+        int pushFrontChild(const KEY_T& key, uint64_t childBid);
+
+        /*
+            @param fromNode: node to copy from
+            @param concateKey: key to insert between two child vectors
+            @return 0 on success, else on failure
+            @note performance is worse than pushBackChilds, may be optimize later
+        */
+        int pushFrontChilds(const NodeData& fromNode, const KEY_T& concateKey) noexcept; 
+
+        /*
+            @param key: key to insert
+            @param rowData: pointer to row data
+            @param dataLen: length of row data
+            @return 0 on success, else on failure
+        */
+        int insertRow(const KEY_T& key, const void* rowData, size_t dataLen);
+
+        /*
+            @param key: key to insert
+            @param rowData: pointer to row data
+            @param dataLen: length of row data
+            @return 0 on success, else on failure
+        */
+        int pushBackRow(const KEY_T& key, const void* rowData, size_t dataLen);
+        int pushBackRows(const NodeData& fromNode) noexcept;
+
+        /*
+            @param key: key to insert
+            @param rowData: pointer to row data
+            @param dataLen: length of row data
+            @return 0 on success, else on failure
+        */
+        int pushFrontRow(const KEY_T& key, const void* rowData, size_t dataLen);
+        int pushFrontRows(const NodeData& fromNode) noexcept;
+
+        int popFrontRow();
+        int popBackRow();
+        int popFrontChild();
+        int popBackChild();
+
+        int printNode() const noexcept;
+
+
+        
+        
+        /*
+            @return number of keys in the node
+        */
+        int size() noexcept;
+        /*
+            @param target: target NodeData to copy from
+            @param begin: begin position (inclusive)
+            @param end: end position (exclusive)
+            @return 0 on success, else on failure
+        */
+        int assign(const NodeData& target, int begin, int end) noexcept;
+        /*
+            @param begin: begin position (inclusive)
+            @param end: end position (exclusive)
+            @return 0 on success, else on failure
+            @note for split node only
+        */
+        int erase(int begin, int end) noexcept;
+
+        /*
+            @param key: key to remove
+            @return 0 on success, else on failure
+            @note if is not leaf node can only be used to remove first or end key
+        */
+        int erase(const KEY_T& key) noexcept;
+
+        struct nd {
+
+            // nd() noexcept {
+            //     hdr = nullptr;
+            //     data = nullptr;
+            //     size = 0;
+            // }
+
+            nd(bool isLeaf, void* dataPtr, uint8_t pageSize, uint8_t rowPageSize) noexcept {
+                data = reinterpret_cast<uint8_t*>(dataPtr);
+                hdr = reinterpret_cast<decltype(hdr)>(data);
+                hdr->leaf = isLeaf ? 1 : 0;
+                if (isLeaf) {
+                    size = rowPageSize * dpfs_lba_size;
+                } else {
+                    size = pageSize * dpfs_lba_size;
+                }
+            }
+
+            nd(nd&& nd) noexcept {
+                this->data = nd.data;
+                this->size = nd.size;
+                hdr = reinterpret_cast<decltype(hdr)>(data);
+                nd.data = nullptr;
+                nd.hdr = nullptr;
+            }
+
+            ~nd() {
+
+            }
+
+            #pragma pack(push, 1)
+            struct hdr_t {
+                uint64_t parent = 0; // parent bid
+                uint64_t prev = 0;   // leaf prev bid
+                uint64_t next = 0;   // leaf next bid
+                uint16_t count = 0;
+                uint16_t secondCount = 0; // childVec or rowVec count 
+                uint8_t leaf = true;
+                // if host is big endian, use it as a flag to indicate data is converted in memory
+                uint8_t isConverted = 0;
+                uint8_t childIsLeaf = 0;
+                char reserve[1];
+            }* hdr;
+            #pragma pack(pop)
+            // point to dma ptr, mange by outside
+            uint8_t* data = nullptr;
+            uint32_t size = 0;
+        }* nodeData = nullptr;
+
+        bidx self{ 0, 0 };
+
+
+        CKeyVec<KEY_T, uint16_t>* keyVec = nullptr;
+        CChildVec* childVec = nullptr;
+        CRowVec* rowVec = nullptr;
+        CPage& m_page;
+        cacheStruct* pCache = nullptr;
+
+        // key start position
+        uint8_t* keys = nullptr;
+        uint8_t keyLen = 0;
+        uint8_t m_pageSize = 0;
+        uint8_t m_rowPageSize = 0; 
+        uint32_t m_rowLen = 0;
+        child_t* children = nullptr;   // internal child pointers
+
+        uint32_t maxKeySize = 0;
+        bool inited = false;
+        bool isRef = false;
+        bool needDelete = false;
+        bool newNode = false;
+    };
+public:
+    CBPlusTree(CPage& pge, CDiskMan& cdm, size_t pageSize, uint8_t& treeHigh, bidx& root, bidx& begin, bidx& end, uint16_t okeyLen, uint32_t orowLen, const std::vector<std::pair<uint8_t, dpfs_datatype_t>>& cmpTypes);
+    ~CBPlusTree();
+    
+    class iterator {
+    public:
+        iterator(CBPlusTree& tree, const bidx& start);
+
+        iterator(const iterator& other);
+
+        /*
+            @note set current iterator to next row
+        */
+        iterator& operator++();
+        /*
+            @note set current iterator to prev row
+        */
+        iterator& operator--();
+
+        iterator operator++(int) noexcept = delete;
+
+        /*
+            @note assign from other iterator, operator= will not load from disk automatically, so need to call loadNode() after this function to activate the iterator
+        */
+        iterator& operator=(const iterator& other);
+
+        bool operator==(const iterator& other) const noexcept { return (m_currentNode == other.m_currentNode) && (m_currentPos == other.m_currentPos); }
+
+        bool operator!=(const iterator& other) const noexcept { return !(*this == other); }
+
+        /*
+            @note retrieve data at current iterator position, before use the iterator, need to call loadNode() first
+        */
+        int loadData(void* outKey, uint32_t outKeyLen, uint32_t& keyLen, void* outRow, uint32_t outRowLen, uint32_t& rowLen);
+        
+        /*
+            @param inputRow row data to write
+            @param len length to write
+            @param offSet write to offSet position of the row
+            @note update data at current iterator position. the key can not be updated.
+        */
+        int updateData(void* inputRow, uint32_t offSet, uint32_t len);
+        
+        /*
+            @note load data at current iterator position, before use the iterator, need to call loadNode() first
+        */
+        int loadNode();
+
+        int isValid() noexcept {
+            return valid;
+        }
+
+        const bidx& getCurrentNodeBid() const noexcept {
+            return m_currentNode;
+        }
+    private:
+        friend class CBPlusTree;
+        friend class CCollection::CIdxIter;
+        CBPlusTree& m_tree;
+        uint32_t m_currentPos = 0;
+        bool loaded = false;
+        bool valid = false;
+        CBPlusTree::NodeData node;
+        bidx m_currentNode = {0, 0};
+    };
+
+    friend class iterator;
+    /*
+        @param key key to insert
+        @param row row buffer pointer
+        @param len length of the input value
+        @return 0 on success, else on failure
+    */
+    int insert(const KEY_T& key, const void* row, uint32_t len);
+
+    /*
+        @param key: key to update
+        @param input: input value pointer
+        @param len: length of the input value
+        @return 0 on success, else on failure
+    */
+    int update(const KEY_T& key, const void* input, uint32_t len);
+
+    /*
+        @param key: key to search
+        @param out: output value
+        @param len: length of the output buffer
+        @param actualLen: actual length of the output value
+        @return 0 on success, nagetive on failure, positive on warning
+        @note if return value > 0, it means output buffer is too small, data is truncated
+    */
+    int search(const KEY_T& key, void* out, uint32_t len, uint32_t* actualLen = nullptr);
+
+    /*
+        @param key: key to search
+        @return iterator to the key on success, end() if not found
+        @attention the iterator will return the position of the key, but the data is not loaded yet, need to call loadNode() before using the iterator
+        @note if the key is not exist, the function will return the lower bound of the key,the first value will bigger the key.
+    */
+    iterator search(const KEY_T& key);
+
+    /*
+        @param key: key to remove
+        @return 0 on success, else on failure
+    */
+    int remove(const KEY_T& key);
+
+    /*
+        @note commit all the changes immediately to disk, after commit, all the nodes in commit cache will be released, and the function will wait for the last write back complete before return
+        @return 0 on success, else on failure
+    */
+    int commit();
+
+    /*
+        @return 0 on success, else on failure
+        @note not support for now, directly return 0, may be implement later, 
+        @concept the function will rollback all the changes in commit cache, 
+        and release all the nodes in commit cache, after rollback, 
+        the state of the tree will be same as before any change, 
+        but the function will not wait for the rollback complete before return, 
+        so the caller need to ensure that no other operation is performed on the tree until the rollback complete
+    */
+    int rollback();
+
+private:
+
+
+
+    // tiny RAII helper for CSpin
+    struct CSpinGuard {
+        explicit CSpinGuard(CSpin& l) : lock(l) { lock.lock(); }
+        ~CSpinGuard() { lock.unlock(); }
+        CSpin& lock;
+    };
+
+    /*
+
+    {ONE BLOCK FOR LEAF NODE}
+                |parent(8B)|prev(8B)|next(8B)|isLeaf(1B)|keyCnt(2B)|reserve(5B)|key|value|...|...|key|value|
+                                                                                |
+    nodeData->                                                                 data[]
+
+
+    {ONE BLOCK FOR INDEX NODE}
+                |parent(8B)|prev(8B)|next(8B)|isLeaf(1B)|keyCnt(2B)|reserve(5B)|keys...|childs...|
+                                                                    |       |
+    nodeData->                                                    data[]  keyCnt * KEYLEN
+
+    Data region layout is compact; all block ids are stored as uint64_t (bid) and
+    gid is inherited from the current node's gid. VALUE is stored as uint64_t
+    reinterpretation of VALUE_T (pointer or integral payload).
+
+    */
+
+
+    /*
+        @note class to manage key vector without dynamic memory allocate
+    */
+    class CChildVec {
+    public:
+        
+        CChildVec(NodeData& nd) : vecSize(nd.nodeData->hdr->secondCount),  child(reinterpret_cast<child_t*>(nd.children)) {
+            maxSize = nd.maxKeySize + 1;
+        }
+        ~CChildVec() = default;
+
+        int clear() noexcept {
+            // vecSize = 0;
+            return 0;
+        }
+        int insert(uint32_t pos, child_t val) noexcept {
+            if (pos > maxSize) {
+                return -EINVAL;
+            } else if (this->size() + 1 > maxSize) {
+                // out of space
+                return -ERANGE;
+            }
+            /*
+            example  
+                [1,2,3,4]
+
+
+                [3]
+                | |
+                | [3,4,5]
+                |
+                [1,2] 
+
+
+
+                [5,15,24,37]
+                |
+            [0,1,2,3,4]      ----->    [-1,0,1]  [2,3,4]
+
+
+
+                [2,5,15,24,37]
+                | |
+                | [2,3,4]
+                |
+            [-1,0,1]
+
+
+                [2,5,15,24,37]
+                    |
+                    [5,8,9,10,12] -> [5,8,9,10,12,14]
+
+                [2,5,10,15,24,37]
+                    |  |
+                    |  [10,12,14]
+                    |
+                [5,8,9] 
+                    
+                [2,5,10,15,24,37] ====> [2,5,10]  [15,24,37]
+
+                           [15]
+                        /       \
+                       /         \        
+                      /           \
+                     /             \
+             [2,5,10]               [15,24,37]
+                 |  |               |  
+                 |  |               |
+                 |  [10,12,14]      null
+                 [5,8,9]
+
+            */
+            std::memmove(&child[pos + 1], &child[pos], (vecSize - pos) * sizeof(child_t));
+            child[pos] = val;
+            ++vecSize;
+            return 0;
+        }
+
+        child_t& at(uint32_t pos) const {
+            if (pos >= maxSize) {
+                throw std::out_of_range("Index out of range");
+            }
+            return child[pos];
+        }
+
+        /*
+        
+address         0 1 2 3 4 5 6 7 8
+                1 2 3 4 5 6 7 8 9
+                size = 9
+
+                address of 5 = 4
+                address of 9 = 8
+                mid, end
+                5 6 7 8 9
+                size = 5
+
+        */
+
+        /*
+            @param begin: begin pointer (inclusive)
+            @param end: end pointer (exclusive)
+            @return 0 on success, else on failure
+            @note assign keys from begin to end to this vector
+        */
+        int assign(const child_t* begin, const child_t* end) noexcept {
+            size_t newSize = static_cast<size_t>(end - begin);
+            if (newSize > maxSize) {
+                return -ERANGE;
+            }
+            std::memcpy(child, begin, newSize * sizeof(child_t));
+            vecSize = static_cast<uint16_t>(newSize);
+            return 0;
+        }
+
+        child_t* begin() {
+            return &child[0];
+        }
+
+        child_t* end() {
+            return &child[this->size()];
+        }
+
+        int erase(int begin, int end) noexcept {
+            if (end < begin) {
+                return -EINVAL;
+            }
+            if (begin >= vecSize + 1) {
+                return -ENOENT;
+            }
+            std::memmove(&child[begin], &child[end], (this->size() - end) * sizeof(child_t));
+            vecSize -= static_cast<uint16_t>(end - begin);
+            return 0;
+        }
+
+        int pop_back() noexcept {
+            if (vecSize == 0) {
+                return -ENOENT;
+            }
+            memset(&child[this->size() - 1], 0, sizeof(child_t));
+            --vecSize;
+            return 0;
+        }
+
+        int pop_front() noexcept {
+            if (vecSize == 0) {
+                return -ENOENT;
+            }
+            std::memmove(&child[0], &child[1], (this->size() - 1) * sizeof(child_t));
+            memset(&child[this->size() - 1], 0, sizeof(child_t));
+            --vecSize;
+            return 0;
+        }
+
+        int push_front(child_t val) noexcept {
+            if (this->size() + 1 > maxSize) {
+                return -ERANGE;
+            }
+            std::memmove(&child[1], &child[0], this->size() * sizeof(child_t));
+            child[0] = val;
+            ++vecSize;
+            return 0;
+        }
+
+        int concate_front(const CChildVec& fromVec) noexcept {
+            if (this->size() + fromVec.size() > maxSize) {
+                return -ERANGE;
+            }
+            std::memmove(&child[fromVec.size()], &child[0], this->size() * sizeof(child_t));
+            std::memcpy(&child[0], fromVec.child, fromVec.size() * sizeof(child_t));
+            vecSize += fromVec.size();
+            return 0;
+        }
+        
+        int push_back(child_t val) noexcept {
+            if (this->size() + 1 > maxSize) {
+                return -ERANGE;
+            }
+            child[this->size()] = val;
+            ++vecSize;
+            return 0;
+        }
+
+        int concate_back(const CChildVec& fromVec) noexcept {
+            if (this->size() + fromVec.size() > maxSize) {
+                return -ERANGE;
+            }
+            std::memcpy(&child[this->size()], fromVec.child, fromVec.size() * sizeof(child_t));
+            vecSize += fromVec.size();
+            return 0;
+        }
+
+        child_t& operator[](uint32_t pos) const {
+            return at(pos);
+        }
+
+        uint32_t size() const noexcept {
+            return vecSize;
+        }
+
+    private:
+        // vecSize is change by keyVec
+        decltype(NodeData::nd::hdr_t::secondCount)& vecSize;
+        // first key pointer
+        child_t* const child;
+        uint32_t maxSize = 0; // = ((PAGESIZE * 4096 - sizeof(NodeData::nd::hdr_t)) - sizeof(uint64_t)) / (KEYLEN + sizeof(uint64_t)) + 1;
+    };
+
+    class CRowVec {
+    public:
+        CRowVec(NodeData& nd, size_t rowLen) : vecSize(nd.nodeData->hdr->secondCount), m_rowLen(rowLen) {
+            maxKeySize = nd.maxKeySize;
+            row = reinterpret_cast<uint8_t*>(nd.nodeData->data + sizeof(NodeData::nd::hdr_t) + (nd.keyLen * maxKeySize));
+        }
+        ~CRowVec() = default;
+
+        /*
+            @param pos: position to insert
+            @param data: data pointer
+            @param dataLen: data length
+            @return 0 on success, else on failure
+            @note insert key to the vector in sorted order
+        */
+        int insert(int pos, const void* data, size_t dataLen) noexcept {
+            if (dataLen > m_rowLen) {
+                // TODO:: use pointer to store data exceed row length
+                // ROW_T rowPtr(row + pos * m_rowLen);
+                return -ENOBUFS;
+            }
+
+            memmove(&row[(pos + 1) * m_rowLen], &row[pos * m_rowLen], (vecSize - pos) * m_rowLen);
+            std::memcpy(&row[pos * m_rowLen], data, dataLen);
+            ++vecSize;
+            return 0;
+        }
+
+        int push_back(const void* data, size_t dataLen) noexcept {
+            if (dataLen > m_rowLen) {
+                return -ENOBUFS;
+            }
+            std::memcpy(&row[vecSize * m_rowLen], data, dataLen);
+            ++vecSize;
+            return 0;
+        }
+
+        int pop_back() noexcept {
+            if (vecSize == 0) {
+                return -ENOENT;
+            }
+            memset(&row[(vecSize - 1) * m_rowLen], 0, m_rowLen);
+            --vecSize;
+            return 0;
+        }
+
+        int concate_back(const CRowVec& fromVec) noexcept {
+            if (vecSize + fromVec.vecSize > maxKeySize) {
+                return -ERANGE;
+            }
+            std::memcpy(&row[vecSize * m_rowLen], fromVec.row, fromVec.vecSize * m_rowLen);
+            vecSize += fromVec.vecSize;
+            return 0;
+        }
+
+        int push_front(const void* data, size_t dataLen) noexcept {
+            if (dataLen > m_rowLen) {
+                return -ENOBUFS;
+            }
+            memmove(&row[m_rowLen * 1], &row[0], vecSize * m_rowLen);
+            std::memcpy(&row[0], data, dataLen);
+            ++vecSize;
+            return 0;
+        }
+
+        int pop_front() noexcept {
+            if (vecSize == 0) {
+                return -ENOENT;
+            }
+            memmove(&row[0], &row[m_rowLen * 1], (vecSize - 1) * m_rowLen);
+            memset(&row[(vecSize - 1) * m_rowLen], 0, m_rowLen);
+            --vecSize;
+            return 0;
+        }
+
+        int concate_front(const CRowVec& fromVec) noexcept {
+            if (vecSize + fromVec.vecSize > maxKeySize) {
+                return -ERANGE;
+            }
+            memmove(&row[fromVec.vecSize * m_rowLen], &row[0], vecSize * m_rowLen);
+            std::memcpy(&row[0], fromVec.row, fromVec.vecSize * m_rowLen);
+            vecSize += fromVec.vecSize;
+            return 0;
+        }
+
+        int assign(const uint8_t* begin, const uint8_t* end) noexcept {
+            size_t newSize = static_cast<size_t>((end - begin) / m_rowLen);
+            if (newSize > maxKeySize) {
+                return -ERANGE;
+            }
+            std::memcpy(row, begin, newSize * m_rowLen);
+            vecSize = static_cast<uint16_t>(newSize);
+            return 0;
+        }
+
+        /*
+            @param pos position of the key
+            @return 0 on success, else on failure.
+            @note remove the row data that relate the key
+        */
+        int erase(const uint64_t& pos) noexcept {
+            if (pos >= vecSize) {
+                return -ENOENT;
+            }
+            memmove(&row[pos * m_rowLen], &row[(pos + 1) * m_rowLen], (vecSize - pos - 1) * m_rowLen);
+            --vecSize;
+            return 0;
+        }
+
+        // must be used before erase the key
+        int erase(const uint64_t& begin, const uint64_t& end) noexcept {
+            if (end < begin) {
+                return -EINVAL;
+            }
+            if (begin >= vecSize) {
+                return -ENOENT;
+            }
+            
+            memmove(&row[begin * m_rowLen], &row[end * m_rowLen], (vecSize - end) * m_rowLen);
+            vecSize -= static_cast<uint16_t>(end - begin);
+            return 0;
+        }
+
+        /*
+            @param pos position of the key
+            @param out the row data will be place here
+            @param bufLen the buffer length of pointer out
+            @param actureLen indicate acture length of the row
+        */
+        int at(uint32_t pos, uint8_t* out, uint32_t bufLen, uint32_t* actureLen) const noexcept {
+            if (pos >= vecSize) {
+                if (actureLen != nullptr) {
+                    *actureLen = 0;
+                }
+                return -ERANGE;
+            }
+            // TODO:: RETURN ACTURE LEN of the row, may larger than m_rowLen(in-row data)
+            if (actureLen != nullptr) {
+                // TODO:: calculate acture length of the row
+                *actureLen = m_rowLen;
+            }
+            if (bufLen < m_rowLen) {
+                return -ENOMEM;
+            }
+            std::memcpy(out, &row[pos * m_rowLen], m_rowLen);
+            return 0;
+        }
+
+        /*
+            @param pos position of the key
+            @param out the row data pointer will be place here
+            @param bufLen the buffer length of pointer out
+            @param actureLen indicate acture length of the row
+        */
+        int reference_at(uint32_t pos, uint8_t*& out, uint32_t* actureLen) const noexcept {
+            if (pos >= vecSize) {
+                if (actureLen != nullptr) {
+                    *actureLen = 0;
+                }
+                return -ERANGE;
+            }
+            // TODO:: RETURN ACTURE LEN of the row, may larger than m_rowLen(in-row data)
+            if (actureLen != nullptr) {
+                // TODO:: calculate acture length of the row
+                *actureLen = m_rowLen;
+            }
+
+            out = &row[pos * m_rowLen];
+            return 0;
+        }
+
+        /*
+            @return max size of the row vector
+        */
+        uint32_t size() const noexcept {
+            return vecSize;
+        }
+
+        uint8_t* data() {
+            return row;
+        }
+
+    private:
+        friend class NodeData;
+        decltype(NodeData::nodeData->hdr->secondCount)& vecSize;
+        // first key pointer
+        uint8_t* row = nullptr;
+        uint32_t m_rowLen = 0;
+        uint32_t maxKeySize = 0;
+    };
+    
+
+    /*
+        @note split leaf node
+        @param left: left node data
+        @param right: right node data, this is the node to be created
+        @param upKey: key to push up to parent
+    */
+    void split_leaf(NodeData& left, NodeData& right, KEY_T& upKey) {
+        right.nodeData->hdr->leaf = true;
+        right.self = allocate_node(true);
+        uint32_t mid = left.keyVec->size() / 2;
+        
+        right.assign(left, static_cast<int>(mid), left.keyVec->size());
+        left.erase(static_cast<int>(mid), left.keyVec->size());
+
+        right.printNode();
+        left.printNode();
+
+        // adjust leaf links
+        // [left] <--> [next]  =====> [left] <--> [right] <--> [next]
+        right.nodeData->hdr->next = left.nodeData->hdr->next;
+        right.nodeData->hdr->prev = left.self.bid;
+        // set the next node's prev to right node
+        if (right.nodeData->hdr->next) update_prev(right.nodeData->hdr->next, right.self.bid);
+
+        // [left].next = [right]
+        left.nodeData->hdr->next = right.self.bid;
+        // set upkey the first key of right node
+        upKey = (*right.keyVec)[0];
+        // update parent of the right node
+        // right.nodeData->hdr->parent = left.nodeData->hdr->parent;
+        
+
+    }
+
+    /*
+        @param idx: node index to split
+        @param key: key to insert
+        @param val: value pointer to insert
+        @param valLen: length of the value
+        @param upKey: key to push up to parent
+        @param upChild: child node index to push up to parent
+        @param isLeaf: indicate whether current node is leaf node
+        @return 0 on success, SPLIT on split, else on failure
+        @note insert the data or split internal node when necessary
+    */
+    int32_t insert_recursive(const bidx& idx, const KEY_T& key, const void* val, size_t valLen, KEY_T& upKey, bidx& upChild, bool isLeaf);
+
+    /*
+        @param left: left node data
+        @param right: right node data, this is the node to be created
+        @param upKey: key to push up to parent
+        @note split index node to two nodes, and push the middle key up to parent node
+    */
+    int split_internal(NodeData& left, NodeData& right, KEY_T& upKey) {
+
+        // problem :: cause node split error
+        int rc = 0;
+        rc = right.initNode(false, m_indexOrder, cmpTyps);
+        if (rc != 0) {
+            return rc;
+        }
+        int keymid = left.keyVec->size() / 2;
+        upKey = (*left.keyVec)[keymid];
+        rc = right.keyVec->assign(left.keyVec->begin() + keymid + 1, left.keyVec->end());
+        if (rc != 0) return rc;
+        rc = right.childVec->assign(&left.childVec->at(keymid + 1), left.childVec->end());
+        if (rc != 0) return rc;
+
+        rc = left.erase(keymid, left.keyVec->size());
+        if (rc != 0) {
+            return rc;
+        }
+
+        // right.nodeData->hdr->parent = left.nodeData->hdr->parent;
+        right.nodeData->hdr->childIsLeaf = left.nodeData->hdr->childIsLeaf;
+        right.self = allocate_node(false);
+        if (right.self.bid == 0) {
+            return -ENOSPC;
+        }
+        return rc;
+
+    }
+
+    /*
+        @param n: node data
+        @param k: key to search
+        @return index of the child to go, or -ERANGE if error
+        @note find the child index to go for the key, 
+        if the key is exist, return the index of the child that is right to the key, 
+        else return the index of the child that is left to the key, 
+        if pos == keyVec->size(), means go to the last child
+    */
+    int32_t child_index(const NodeData& n, const KEY_T& k) const noexcept {
+        int64_t pos = n.keyVec->search(k);
+        //  10 22 23 25 28  (21)
+        // 0  1  2  3  4  5
+        // if k != 22
+        // -> pos = 1 -> child = 1
+        // if find k == 22
+        // -> pos = 1 -> child = 2
+
+        int rc = 0;
+        KEY_T key(cmpTyps);
+        rc = n.keyVec->at(pos, key);
+        if (rc == 0 && k == key) {
+            ++pos;
+        }
+
+        #ifdef __BPDEBUG__
+        string ks((char*)key.data, key.len);
+        cout << "child_index: key " << ks << endl;;
+        cout << " found at pos " << pos << endl;
+        #endif
+        
+        if (pos > n.keyVec->size()) {
+            return -ERANGE;
+        }
+
+        return static_cast<int32_t>(pos);
+    }
+
+    /*
+        @note ensure root node exists
+        @return 0 on success, else on failure
+    */
+    int ensure_root();
+
+    bidx allocate_node(bool isLeaf) {
+        bidx id{0, 0};
+        id.gid = nodeId;
+        if (!isLeaf) {
+            id.bid = m_diskman.balloc(m_pageSize);
+        } else {
+            id.bid = m_diskman.balloc(m_rowPageSize);
+        }
+        return id;
+    }
+
+    int free_node(bidx lba, bool isLeaf) {
+        if (!isLeaf) {
+            return m_diskman.bfree(lba.bid, m_pageSize);
+        } else {
+            return m_diskman.bfree(lba.bid, m_rowPageSize);
+        }
+
+        return 0;
+    }
+
+    /*
+        @note destroy the whole tree, free all the nodes in the tree, and clear the cache
+    */
+    int destroy();
+    int destroy_recursive(const bidx& idx, bool isLeaf);
+
+
+    /*
+        @param idx: node index to remove
+        @param key: key to remove
+        @param upKey: key to push up to parent
+        @param upChild: child node index to push up to parent
+        @param isLeaf: indicate whether current node is leaf node
+        @return 0 on success, COMBINE on combine, else on failure
+        @note remove the data or combine internal node when necessary
+    */
+    int32_t remove_recursive(const bidx& idx, const KEY_T& key, KEY_T& upKey, bool isLeaf);
+    
+    
+    /*
+        @param node: node data
+        @param idxChild: index of the child that need to be combined
+        @param childUp: key to push up to parent
+        @param childNew: new child index if combine is happened
+        @return 0 on success, else on failure
+        @note combine child node at idxChild with its sibling, and node should be locked before call this function
+    */
+    int32_t combine_child(NodeData& node, int32_t idxChild);
+
+    /*
+        @param parent: parent node data
+        @param fromNode: node to borrow from
+        @param toNode: node to borrow to
+        @param isLeaf: indicate whether current node is leaf node
+        @param fromLeft: indicate whether borrow from left sibling
+        @param targetIdx: index of the target child in parent node
+        @return 0 on success, else on failure
+        @note borrow one key from sibling node
+    */
+    int32_t borrowKey(NodeData& parent, NodeData& fromNode, NodeData& toNode, bool isLeaf, bool fromLeft, int targetIdx);
+    int32_t mergeNode(NodeData& parent, NodeData& fromNode, NodeData& toNode, bool isLeaf, bool fromLeft, int targetIdx);
+
+    void reinitBase(uint8_t* high, bidx* m_root, bidx* m_begin, bidx* m_end) noexcept {
+        this->high = high;
+        this->m_root = m_root;
+        this->m_begin = m_begin;
+        this->m_end = m_end;
+        // return 0;
+    }
+
+private:
+    enum InsertResult { 
+        OK = 0, 
+        SPLIT = 1 << 0,      // split node
+        COMBINE = 1 << 1,    // combine two nodes, or borrow from sibling
+        UPDATEKEY = 1 << 2,  // remove the left of child, need update the index key
+        EMPTY = 1 << 3,      // node is empty after delete
+    };
+
+    /*
+        return the size of one index node in lba unit
+    */
+    size_t node_lba_len() const noexcept {
+        return m_pageSize;
+    }
+
+    // union nodeHdr {
+    //     nodeHdr(){}
+    //     #pragma pack(push, 1)
+    //     struct hdr_t {
+    //         uint64_t parent = 0; // parent bid
+    //         uint64_t prev = 0;   // leaf prev bid
+    //         uint64_t next = 0;   // leaf next bid
+    //         uint16_t count = 0;
+    //         uint16_t secondCount = 0; // childVec or rowVec count 
+    //         uint8_t leaf = true;
+    //         uint8_t isConverted = 0;
+    //         uint8_t childIsLeaf = 0;
+    //         char reserve[1];
+    //     } hdr;
+    //     uint8_t data[dpfs_lba_size];
+    //     #pragma pack(pop)
+    // };
+
+    /*
+        @param idx: node index to load
+        @param out: output node data
+        @return 0 on success, else on failure
+        @note load node data from storage
+    */
+    // TODO:: update code finish loadnode and storenode functions...
+    int load_node(const bidx& idx, NodeData& out, bool isLeaf) {
+
+        int rc = 0;
+        auto it = m_commitCache.find(idx);
+        if (it != m_commitCache.end()) {
+            out = &it->second;
+            return 0;
+        }
+        
+        cacheStruct* p = nullptr;
+        rc = m_page.get(p, idx, isLeaf ? m_rowPageSize : m_pageSize);
+
+        if (rc != 0 || p == nullptr) return rc;
+        uint8_t* base = reinterpret_cast<uint8_t*>(p->getPtr());
+
+
+        out.pCache = p;
+        out.self = idx;
+
+        rc = out.initNodeByLoad(isLeaf, isLeaf ? m_rowOrder : m_indexOrder, base, cmpTyps);
+        if (rc != 0) {
+            out.pCache->release();
+            return rc;
+        }
+
+        #ifdef __BPDEBUG__
+
+        cout << "Loaded node gid: " << idx.gid << " bid: " << idx.bid << endl;
+        cout << "  isLeaf: " << (int)(out.nodeData->hdr->leaf) << " keyCount: " << out.nodeData->hdr->count << " secondCount: " << out.nodeData->hdr->secondCount << endl;
+        
+        #endif
+
+        if (B_END) {
+            // TODO convert keys and values to host endian if needed
+            // storage is always little endian, if host is big endian, need convert
+        }
+
+        return 0;
+    }
+
+    /*
+        @param node: node data to store
+        @return 0 on success, else on failure
+        @note store node data to storage
+    */
+    int store_node(NodeData& node) {
+        // save the node that to be stored, until commit is called ?
+        // if node is reference, no need to store
+        if (node.isRef) return 0;
+
+        int rc = 0;
+        if (!node.pCache) {
+            rc = m_page.put(node.self, node.nodeData->data, nullptr, node.nodeData->hdr->leaf ? m_rowPageSize : m_pageSize, false, &node.pCache);
+            // fetch the cache struct
+            if (rc != 0) return rc;
+        }
+        #ifdef __BPDEBUG__
+
+        cout << "store node gid: " << node.self.gid << " bid: " << node.self.bid << endl;
+        cout << "  isLeaf: " << (int)(node.nodeData->hdr->leaf) << " keyCount: " << node.nodeData->hdr->count << " secondCount: " << node.nodeData->hdr->secondCount << endl;
+        
+        #endif
+        m_commitCache.emplace(node.self, std::move(node));
+        return 0;
+    }
+
+
+
+    void update_prev(uint64_t bid, uint64_t newPrev) {
+        NodeData n(m_page, keyLen, m_pageSize, m_rowPageSize, m_rowLen);
+        bidx idx{nodeId, bid};
+        if (load_node(idx, n, true) == 0) {
+            n.nodeData->hdr->prev = newPrev;
+            store_node(n);
+        }
+    }
+
+
+public:
+    void printTree();
+    void printTreeRecursive(const bidx& idx, bool isLeaf, int level);
+
+    iterator begin() {
+        return {*this, *m_begin};
+    }
+
+    iterator end() {
+        return {*this, *m_end};
+    }
+
+private:
+    friend class CCollection;
+    friend class nodeLocker;
+
+    CPage& m_page;
+    CDiskMan& m_diskman;
+    // const CCollection& m_collection;
+
+
+
+
+    // max key count in one node
+    uint32_t maxkeyCount = 0;
+    uint32_t m_rowLen = 0;
+    uint16_t keyLen = 0;
+    int32_t m_indexOrder = 0;
+    int32_t m_rowOrder = 0;
+    uint8_t m_pageSize = 0; // requested page blocks per fetch
+    uint8_t m_rowPageSize = 0; // requested page blocks per fetch for row page
+    CSpin m_lock;
+
+    // if high == 1, root is leaf node
+    uint8_t* high;
+    bidx* m_root;
+    bidx* m_begin;
+    bidx* m_end;
+    const std::vector<std::pair<uint8_t, dpfs_datatype_t>>& cmpTyps;
+    std::unordered_map<bidx, NodeData> m_commitCache;
+};
+
+class nodeLocker : public cacheLocker {
+public:
+    nodeLocker(cacheStruct* cs, CPage& pge, CBPlusTree::NodeData& node, bool isLeaf, const std::vector<std::pair<uint8_t, dpfs_datatype_t>>& keyType);
+    virtual ~nodeLocker();
+    virtual int reinitStruct() override;
+    CBPlusTree::NodeData& m_nd;
+    bool m_isLeaf = false;
+    const std::vector<std::pair<uint8_t, dpfs_datatype_t>>& m_keyType;
+};
