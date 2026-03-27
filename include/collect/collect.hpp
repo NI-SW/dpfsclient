@@ -1008,7 +1008,7 @@ public:
         @return 0 on success, else on failure
         @warning must be called after initialize and columns are set.
     */
-    int initBPlusTreeIndex();
+    int initBPlusTreeIndex(bool createIndex = false);
 
     /*
         create a new index for the collection
@@ -1100,6 +1100,7 @@ public:
             dataStruct_t() = delete;
             ~dataStruct_t() = default;
 
+            size_t m_rowCount = 0;
             //above 1B
             // 16B
             // b plus tree root 
